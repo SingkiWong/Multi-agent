@@ -1,0 +1,1413 @@
+```python
+# =============================================================================
+# 方案C: 主动学习 + 多智能体数字孪生系统 - 完整实现
+# =============================================================================
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import numpy as np
+from typing import Dict, List, Tuple, Optional
+import gpytorch
+from scipy.optimize import minimize
+import networkx as nx
+from collections import deque
+import copy
+
+# =============================================================================
+# PART 1: 数字孪生基础架构
+# =============================================================================
+
+class PhysicsInformedNN(nn.Module):
+    """物理知识嵌入的数字孪生神经网络"""
+    def __init__(self, state_dim: int, action_dim: int, hidden_dims: List[int] = [128, 64, 32]):
+        super().__init__()
+        self.state_dim = state_dim
+        self.action_dim = action_dim
+        
+        layers = []
+        dims = [state_dim + action_dim] + hidden_dims
+        for i in range(len(dims) - 1):
+            layers.extend([
+                nn.Linear(dims[i], dims[i+1]),
+                nn.LayerNorm(dims[i+1]),
+                nn.ReLU(),
+                nn.Dropout(0.1)
+            ])
+        layers.append(nn.Linear(dims[-1], state_dim))
+        self.net = nn.Sequential(*layers)
+        
+    def forward(self, state, action):
+        if state.dim() == 1:
+            state = state.unsqueeze(0)
+        if action.dim() == 1:
+            action = action.unsqueeze(0)
+        x = torch.cat([state, action], dim=-1)
+        delta_state = self.net(x)
+        return state + delta_state
+    
+    def physics_loss(self, pred_state, state, action):
+        """物理约束损失"""
+        batch_size = pred_state.shape[0]
+        num_buses = self.state_dim // 4
+        
+        # 提取状态变量
+        V_pred = pred_state[:, :num_buses]
+        theta_pred = pred_state[:, num_buses:2*num_buses]
+        P_pred = pred_state[:, 2*num_buses:3*num_buses]
+        Q_pred = pred_state[:, 3*num_buses:]
+        
+        # 功率平衡约束
+        P_gen = action[:, 0:1]
+        P_load = state[:, 2*num_buses:3*num_buses].sum(dim=1, keepdim=True)
+        power_balance = (P_gen - P_load).pow(2).mean()
+        
+        # 电压约束（软约束）
+        voltage_penalty = torch.relu(V_pred - 1.05).mean() + torch.relu(0.95 - V_pred).mean()
+        
+        # 相位连续性
+        phase_continuity = (theta_pred[:, 1:] - theta_pred[:, :-1]).pow(2).mean()
+        
+        return power_balance + 100 * voltage_penalty + 0.1 * phase_continuity
+
+
+class BayesianDigitalTwin(gpytorch.models.ExactGP):
+    """基于高斯过程的贝叶斯数字孪生"""
+    def __init__(self, train_x, train_y, likelihood):
+        super().__init__(train_x, train_y, likelihood)
+        self.mean_module = gpytorch.means.ConstantMean()
+        self.covar_module = gpytorch.kernels.ScaleKernel(
+            gpytorch.kernels.RBFKernel(ard_num_dims=train_x.shape[-1])
+        )
+    
+    def forward(self, x):
+        mean_x = self.mean_module(x)
+        covar_x = self.covar_module(x)
+        return gpytorch.distributions.MultivariateNormal(mean_x, covar_x)
+
+
+class EnsembleDigitalTwin:
+    """深度集成不确定性量化"""
+    def __init__(self, num_models: int, state_dim: int, action_dim: int):
+        self.num_models = num_models
+        self.models = [
+            PhysicsInformedNN(state_dim, action_dim, [128, 64, 32])
+            for _ in range(num_models)
+        ]
+        self.optimizers = [
+            torch.optim.Adam(m.parameters(), lr=1e-3, weight_decay=1e-5) 
+            for m in self.models
+        ]
+        
+    def predict_with_uncertainty(self, state, action):
+        """预测均值和不确定性"""
+        self.eval()
+        with torch.no_grad():
+            if state.dim() == 1:
+                state = state.unsqueeze(0)
+            if action.dim() == 1:
+                action = action.unsqueeze(0)
+                
+            predictions = torch.stack([m(state, action) for m in self.models])
+            mean = predictions.mean(dim=0)
+            std = predictions.std(dim=0)
+        return mean, std
+    
+    def train_step(self, state, action, next_state):
+        """训练一步"""
+        losses = []
+        for model, opt in zip(self.models, self.optimizers):
+            model.train()
+            opt.zero_grad()
+            
+            pred = model(state, action)
+            mse_loss = F.mse_loss(pred, next_state)
+            physics_loss = model.physics_loss(pred, state, action)
+            loss = mse_loss + 0.1 * physics_loss
+            
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            opt.step()
+            
+            losses.append(loss.item())
+        return np.mean(losses)
+    
+    def eval(self):
+        for m in self.models:
+            m.eval()
+    
+    def train(self):
+        for m in self.models:
+            m.train()
+
+
+# =============================================================================
+# PART 2: 安全主动学习
+# =============================================================================
+
+class GridSafetyChecker:
+    """电网安全约束检查"""
+    def __init__(self, config: Dict):
+        self.V_min = config.get('V_min', 0.95)
+        self.V_max = config.get('V_max', 1.05)
+        self.f_nominal = config.get('f_nominal', 50.0)
+        self.f_threshold = config.get('f_threshold', 0.2)
+        self.line_capacity = config.get('line_capacity', 100.0)
+        self.num_buses = config.get('num_buses', 39)
+    
+    def check_voltage(self, state):
+        """检查电压约束"""
+        voltage = state[:, :self.num_buses]
+        return torch.all((voltage >= self.V_min) & (voltage <= self.V_max))
+    
+    def check_frequency(self, state):
+        """检查频率约束"""
+        # 假设频率存储在特定位置
+        if state.shape[1] > 3 * self.num_buses:
+            frequency = state[:, 3*self.num_buses]
+            return torch.all(torch.abs(frequency - self.f_nominal) < self.f_threshold)
+        return True
+    
+    def check_thermal(self, state):
+        """检查线路热稳定"""
+        if state.shape[1] > 2 * self.num_buses:
+            power_flows = state[:, 2*self.num_buses:3*self.num_buses]
+            return torch.all(torch.abs(power_flows) <= self.line_capacity)
+        return True
+    
+    def evaluate_risk(self, state):
+        """综合风险评估"""
+        if state.dim() == 1:
+            state = state.unsqueeze(0)
+            
+        voltage = state[:, :self.num_buses]
+        voltage_risk = (
+            torch.relu(voltage - self.V_max).sum() + 
+            torch.relu(self.V_min - voltage).sum()
+        ) / self.num_buses
+        
+        # 功率不平衡风险
+        if state.shape[1] > 2 * self.num_buses:
+            power = state[:, 2*self.num_buses:3*self.num_buses]
+            power_risk = torch.abs(power.sum(dim=1)).mean()
+        else:
+            power_risk = torch.tensor(0.0)
+        
+        return voltage_risk + 0.1 * power_risk
+
+
+class SafeActiveDigitalTwin:
+    """安全主动学习框架"""
+    def __init__(self, state_dim: int, action_dim: int, config: Dict):
+        self.state_dim = state_dim
+        self.action_dim = action_dim
+        self.digital_twin = EnsembleDigitalTwin(5, state_dim, action_dim)
+        self.safety_checker = GridSafetyChecker(config)
+        self.kappa = config.get('kappa', 2.0)
+        self.lambda_safety = config.get('lambda_safety', 10.0)
+        self.risk_threshold = config.get('risk_threshold', 0.01)
+        
+        # 经验缓冲区
+        self.buffer = deque(maxlen=10000)
+        
+    def acquisition_function(self, state, action, mean, std, risk):
+        """UCB采集函数 with 安全惩罚"""
+        exploitation = -mean.norm()  # 最小化预测误差
+        exploration = self.kappa * std.mean()  # 探索高不确定性
+        safety_penalty = self.lambda_safety * risk
+        return exploitation + exploration - safety_penalty
+    
+    def select_next_exploration(self, current_state, num_candidates: int = 100):
+        """选择下一个安全探索动作"""
+        if current_state.dim() == 1:
+            current_state = current_state.unsqueeze(0)
+            
+        candidates = self._generate_candidates(current_state, num_candidates)
+        
+        safe_candidates = []
+        acquisition_values = []
+        
+        for action in candidates:
+            mean, std = self.digital_twin.predict_with_uncertainty(current_state, action)
+            pred_state = mean
+            risk = self.safety_checker.evaluate_risk(pred_state)
+            
+            # 安全过滤
+            if risk.item() < self.risk_threshold:
+                acq_value = self.acquisition_function(current_state, action, 
+                                                     mean - current_state, std, risk)
+                safe_candidates.append(action)
+                acquisition_values.append(acq_value.item())
+        
+        if not safe_candidates:
+            # 如果没有安全候选，返回零动作
+            return torch.zeros(1, self.action_dim)
+        
+        best_idx = np.argmax(acquisition_values)
+        return safe_candidates[best_idx]
+    
+    def _generate_candidates(self, state, num_candidates):
+        """生成候选动作（基于当前状态的扰动）"""
+        candidates = []
+        for _ in range(num_candidates):
+            # 生成小幅扰动
+            perturbation = torch.randn(1, self.action_dim) * 0.1
+            # 限制在合理范围内
+            action = torch.clamp(perturbation, -1.0, 1.0)
+            candidates.append(action)
+        return candidates
+    
+    def update_with_real_data(self, state, action, next_state):
+        """用实测数据更新数字孪生"""
+        if state.dim() == 1:
+            state = state.unsqueeze(0)
+        if action.dim() == 1:
+            action = action.unsqueeze(0)
+        if next_state.dim() == 1:
+            next_state = next_state.unsqueeze(0)
+            
+        # 存储到缓冲区
+        self.buffer.append((state.clone(), action.clone(), next_state.clone()))
+        
+        # 批量更新
+        if len(self.buffer) >= 32:
+            batch = list(np.random.choice(len(self.buffer), 32, replace=False))
+            batch_states = torch.cat([self.buffer[i][0] for i in batch])
+            batch_actions = torch.cat([self.buffer[i][1] for i in batch])
+            batch_next_states = torch.cat([self.buffer[i][2] for i in batch])
+            
+            loss = self.digital_twin.train_step(batch_states, batch_actions, batch_next_states)
+            return loss
+        
+        return self.digital_twin.train_step(state, action, next_state)
+    
+    def compute_uncertainty_reduction(self, state, action):
+        """计算信息增益（不确定性减少量）"""
+        _, std_before = self.digital_twin.predict_with_uncertainty(state, action)
+        return std_before.mean().item()
+
+
+# =============================================================================
+# PART 3: 多智能体博弈框架
+# =============================================================================
+
+class Agent:
+    """智能体基类"""
+    def __init__(self, agent_id: int, state_dim: int, action_dim: int, config: Dict):
+        self.id = agent_id
+        self.state_dim = state_dim
+        self.action_dim = action_dim
+        
+        self.policy_net = self._build_policy_net(state_dim, action_dim)
+        self.target_policy_net = self._build_policy_net(state_dim, action_dim)
+        self.target_policy_net.load_state_dict(self.policy_net.state_dict())
+        
+        self.value_net = self._build_value_net(state_dim)
+        self.target_value_net = self._build_value_net(state_dim)
+        self.target_value_net.load_state_dict(self.value_net.state_dict())
+        
+        self.digital_twin = PhysicsInformedNN(state_dim, action_dim, [64, 32])
+        
+        self.optimizer_policy = torch.optim.Adam(self.policy_net.parameters(), lr=3e-4)
+        self.optimizer_value = torch.optim.Adam(self.value_net.parameters(), lr=1e-3)
+        self.optimizer_twin = torch.optim.Adam(self.digital_twin.parameters(), lr=1e-3)
+        
+        self.gamma = config.get('gamma', 0.99)
+        self.tau = config.get('tau', 0.005)
+        
+        # 经验回放
+        self.memory = deque(maxlen=10000)
+        
+    def _build_policy_net(self, state_dim, action_dim):
+        return nn.Sequential(
+            nn.Linear(state_dim, 256), nn.ReLU(),
+            nn.Linear(256, 128), nn.ReLU(),
+            nn.Linear(128, action_dim), nn.Tanh()
+        )
+    
+    def _build_value_net(self, state_dim):
+        return nn.Sequential(
+            nn.Linear(state_dim, 256), nn.ReLU(),
+            nn.Linear(256, 128), nn.ReLU(),
+            nn.Linear(128, 1)
+        )
+    
+    def select_action(self, state, explore: bool = True, epsilon: float = 0.1):
+        """选择动作"""
+        if state.dim() == 1:
+            state = state.unsqueeze(0)
+            
+        with torch.no_grad():
+            action = self.policy_net(state)
+            if explore and np.random.random() < epsilon:
+                action += torch.randn_like(action) * 0.2
+                action = torch.clamp(action, -1.0, 1.0)
+        return action.squeeze(0)
+    
+    def compute_reward(self, state, action, next_state):
+        """智能体特定的奖励函数 - 子类实现"""
+        raise NotImplementedError
+    
+    def update_policy(self, state, action, reward, next_state, other_actions):
+        """更新策略网络（PPO风格）"""
+        if state.dim() == 1:
+            state = state.unsqueeze(0)
+        if action.dim() == 1:
+            action = action.unsqueeze(0)
+        if next_state.dim() == 1:
+            next_state = next_state.unsqueeze(0)
+            
+        # 存储经验
+        self.memory.append((state, action, reward, next_state))
+        
+        # 批量更新
+        if len(self.memory) < 32:
+            return 0.0
+            
+        batch_indices = np.random.choice(len(self.memory), 32, replace=False)
+        batch_states = torch.cat([self.memory[i][0] for i in batch_indices])
+        batch_actions = torch.cat([self.memory[i][1] for i in batch_indices])
+        batch_rewards = torch.tensor([self.memory[i][2] for i in batch_indices], dtype=torch.float32).unsqueeze(1)
+        batch_next_states = torch.cat([self.memory[i][3] for i in batch_indices])
+        
+        # 更新价值网络
+        self.optimizer_value.zero_grad()
+        current_values = self.value_net(batch_states)
+        with torch.no_grad():
+            next_values = self.target_value_net(batch_next_states)
+            target_values = batch_rewards + self.gamma * next_values
+        value_loss = F.mse_loss(current_values, target_values)
+        value_loss.backward()
+        torch.nn.utils.clip_grad_norm_(self.value_net.parameters(), 1.0)
+        self.optimizer_value.step()
+        
+        # 更新策略网络
+        self.optimizer_policy.zero_grad()
+        predicted_actions = self.policy_net(batch_states)
+        advantages = (target_values - current_values).detach()
+        policy_loss = -(predicted_actions * advantages).mean()
+        policy_loss.backward()
+        torch.nn.utils.clip_grad_norm_(self.policy_net.parameters(), 1.0)
+        self.optimizer_policy.step()
+        
+        # 软更新目标网络
+        self._soft_update(self.value_net, self.target_value_net)
+        self._soft_update(self.policy_net, self.target_policy_net)
+        
+        # 更新局部数字孪生
+        self.optimizer_twin.zero_grad()
+        pred_next = self.digital_twin(batch_states, batch_actions)
+        twin_loss = F.mse_loss(pred_next, batch_next_states)
+        twin_loss += 0.1 * self.digital_twin.physics_loss(pred_next, batch_states, batch_actions)
+        twin_loss.backward()
+        self.optimizer_twin.step()
+        
+        return (policy_loss.item() + value_loss.item() + twin_loss.item())
+    
+    def _soft_update(self, source, target):
+        """软更新目标网络"""
+        for target_param, param in zip(target.parameters(), source.parameters()):
+            target_param.data.copy_(self.tau * param.data + (1.0 - self.tau) * target_param.data)
+    
+    def forecast(self, state, horizon: int = 24):
+        """使用局部数字孪生进行预测"""
+        predictions = []
+        current_state = state.clone()
+        
+        with torch.no_grad():
+            for _ in range(horizon):
+                action = self.select_action(current_state, explore=False)
+                next_state = self.digital_twin(current_state, action)
+                predictions.append(next_state)
+                current_state = next_state
+        
+        return torch.stack(predictions)
+
+
+class WindFarmAgent(Agent):
+    """风电场智能体"""
+    def compute_reward(self, state, action, next_state):
+        if state.dim() == 1:
+            state = state.unsqueeze(0)
+        if action.dim() == 1:
+            action = action.unsqueeze(0)
+        if next_state.dim() == 1:
+            next_state = next_state.unsqueeze(0)
+            
+        # 电价（假设在状态中）
+        price = 50.0 + torch.randn(1) * 10.0
+        
+        # 竞标功率和实际功率
+        bid_power = action[:, 0] * 100  # 归一化到0-100 MW
+        actual_power = torch.clamp(bid_power + torch.randn_like(bid_power) * 5, 0, 100)
+        
+        # 收益 = 电价 × 出力 - 偏差惩罚
+        revenue = price * actual_power
+        penalty = 50.0 * torch.abs(bid_power - actual_power)
+        
+        reward = revenue - penalty
+        return reward.mean()
+
+
+class SolarAgent(Agent):
+    """光伏电站智能体"""
+    def compute_reward(self, state, action, next_state):
+        if state.dim() == 1:
+            state = state.unsqueeze(0)
+        if action.dim() == 1:
+            action = action.unsqueeze(0)
+        if next_state.dim() == 1:
+            next_state = next_state.unsqueeze(0)
+            
+        price = 50.0 + torch.randn(1) * 10.0
+        
+        # 可用光伏 × (1 - 弃光率)
+        available_solar = 80.0 + torch.randn(1) * 20.0
+        curtailment_rate = torch.sigmoid(action[:, 0]) * 0.3  # 0-30%弃光
+        actual_gen = available_solar * (1 - curtailment_rate)
+        
+        # 负电价惩罚
+        negative_price_penalty = torch.relu(-price) * actual_gen
+        
+        revenue = price * actual_gen - negative_price_penalty
+        return revenue.mean()
+
+
+class StorageAgent(Agent):
+    """储能智能体"""
+    def __init__(self, agent_id: int, state_dim: int, action_dim: int, config: Dict):
+        super().__init__(agent_id, state_dim, action_dim, config)
+        self.soc = 0.5  # 初始SOC
+        self.capacity = 100.0  # MWh
+        
+    def compute_reward(self, state, action, next_state):
+        if state.dim() == 1:
+            state = state.unsqueeze(0)
+        if action.dim() == 1:
+            action = action.unsqueeze(0)
+            
+        price = 50.0 + torch.randn(1) * 10.0
+        
+        # 充放电功率
+        charge = torch.relu(-action[:, 0]) * 50  # 充电
+        discharge = torch.relu(action[:, 0]) * 50  # 放电
+        
+        # 更新SOC
+        self.soc += (discharge - charge) / self.capacity * 0.1
+        self.soc = np.clip(self.soc, 0.1, 0.9)
+        
+        # 套利收益
+        arbitrage = price * (discharge - charge)
+        
+        # 调频服务收入
+        regulation_revenue = torch.abs(action[:, 0]) * 5.0
+        
+        # 退化成本
+        degradation = 0.01 * (charge + discharge)
+        
+        # SOC约束惩罚
+        soc_penalty = 100 * (torch.relu(0.2 - self.soc) + torch.relu(self.soc - 0.8))
+        
+        reward = arbitrage + regulation_revenue - degradation - soc_penalty
+        return reward.mean()
+
+
+class GridOperatorAgent(Agent):
+    """电网调度中心智能体"""
+    def compute_reward(self, state, action, next_state):
+        if state.dim() == 1:
+            state = state.unsqueeze(0)
+        if action.dim() == 1:
+            action = action.unsqueeze(0)
+        if next_state.dim() == 1:
+            next_state = next_state.unsqueeze(0)
+            
+        # 发电成本
+        generation = torch.relu(action[:, 0]) * 100
+        generation_cost = generation * 30.0
+        
+        # 备用容量成本
+        reserve = torch.relu(action[:, 1]) * 20
+        reserve_cost = reserve * 10.0
+        
+        # 稳定性惩罚
+        num_buses = self.state_dim // 4
+        voltage = next_state[:, :num_buses]
+        voltage_penalty = (
+            torch.relu(voltage - 1.05).sum() + 
+            torch.relu(0.95 - voltage).sum()
+        ) * 100
+        
+        # 负荷平衡惩罚
+        power = next_state[:, 2*num_buses:3*num_buses]
+        balance_penalty = torch.abs(power.sum(dim=1)).mean() * 50
+        
+        reward = -(generation_cost + reserve_cost + voltage_penalty + balance_penalty)
+        return reward.mean()
+
+
+class NashEquilibriumSolver:
+    """Nash均衡求解器"""
+    def __init__(self, agents: List[Agent], max_iter: int = 50):
+        self.agents = agents
+        self.max_iter = max_iter
+        self.tolerance = 1e-3
+    
+    def solve(self, state, initial_actions):
+        """迭代最优响应求解Nash均衡"""
+        if state.dim() == 1:
+            state = state.unsqueeze(0)
+            
+        actions = [a.clone() if isinstance(a, torch.Tensor) else a for a in initial_actions]
+        
+        for iteration in range(self.max_iter):
+            converged = True
+            
+            for i, agent in enumerate(self.agents):
+                others_actions = [actions[j] for j in range(len(actions)) if j != i]
+                
+                # 计算最优响应
+                best_response = self._compute_best_response(
+                    agent, state, others_actions, actions[i]
+                )
+                
+                # 检查收敛
+                if torch.norm(best_response - actions[i]) > self.tolerance:
+                    actions[i] = best_response
+                    converged = False
+            
+            if converged:
+                break
+        
+        return actions
+    
+    def _compute_best_response(self, agent, state, others_actions, current_action):
+        """计算智能体的最优响应"""
+        # 使用梯度上升优化
+        action = current_action.clone().detach().requires_grad_(True)
+        optimizer = torch.optim.Adam([action], lr=0.01)
+        
+        for _ in range(20):
+            optimizer.zero_grad()
+            next_state = agent.digital_twin(state, action)
+            reward = agent.compute_reward(state, action, next_state)
+            loss = -reward  # 最大化奖励
+            loss.backward()
+            optimizer.step()
+            action.data.clamp_(-1.0, 1.0)
+        
+        return action.detach()
+    
+    def is_nash_equilibrium(self, actions, state, epsilon: float = 1e-2):
+        """检查是否为Nash均衡"""
+        if state.dim() == 1:
+            state = state.unsqueeze(0)
+            
+        for i, agent in enumerate(self.agents):
+            current_action = actions[i]
+            others_actions = [actions[j] for j in range(len(actions)) if j != i]
+            
+            best_response = self._compute_best_response(
+                agent, state, others_actions, current_action
+            )
+            
+            if torch.norm(best_response - current_action) > epsilon:
+                return False
+        
+        return True
+    
+    def compute_nash_gap(self, actions, state):
+        """计算Nash间隙"""
+        if state.dim() == 1:
+            state = state.unsqueeze(0)
+            
+        gaps = []
+        for i, agent in enumerate(self.agents):
+            current_action = actions[i]
+            current_next_state = agent.digital_twin(state, current_action)
+            current_reward = agent.compute_reward(state, current_action, current_next_state)
+            
+            others_actions = [actions[j] for j in range(len(actions)) if j != i]
+            best_response = self._compute_best_response(agent, state, others_actions, current_action)
+            best_next_state = agent.digital_twin(state, best_response)
+            best_reward = agent.compute_reward(state, best_response, best_next_state)
+            
+            gap = (best_reward - current_reward).item()
+            gaps.append(max(0, gap))
+        
+        return max(gaps)
+
+
+class MultiAgentDigitalTwinGame:
+    """多智能体数字孪生博弈系统"""
+    def __init__(self, num_agents: int, state_dim: int, action_dim: int, config: Dict):
+        self.state_dim = state_dim
+        self.action_dim = action_dim
+        self.agents = self._create_agents(num_agents, state_dim, action_dim, config)
+        self.nash_solver = NashEquilibriumSolver(self.agents, max_iter=20)
+        self.state = torch.zeros(state_dim)
+        self.config = config
+        
+    def _create_agents(self, num_agents, state_dim, action_dim, config):
+        """创建不同类型的智能体"""
+        agents = []
+        agent_types = [WindFarmAgent, SolarAgent, StorageAgent, GridOperatorAgent]
+        
+        for i in range(num_agents):
+            agent_class = agent_types[i % len(agent_types)]
+            agents.append(agent_class(i, state_dim, action_dim, config))
+        
+        return agents
+    
+    def reset(self, initial_state=None):
+        """重置游戏状态"""
+        if initial_state is not None:
+            self.state = initial_state.clone()
+        else:
+            num_buses = self.state_dim // 4
+            self.state = torch.zeros(self.state_dim)
+            self.state[:num_buses] = 1.0  # 初始电压
+        return self.state
+    
+    def step(self, actions: List[torch.Tensor]):
+        """执行一步博弈"""
+        rewards = []
+        next_states = []
+        
+        for i, agent in enumerate(self.agents):
+            # 每个智能体用自己的数字孪生预测
+            next_state = agent.digital_twin(self.state.unsqueeze(0), actions[i].unsqueeze(0))
+            reward = agent.compute_reward(self.state.unsqueeze(0), actions[i].unsqueeze(0), next_state)
+            
+            next_states.append(next_state.squeeze(0))
+            rewards.append(reward)
+        
+        # 聚合所有预测（加权平均或投票）
+        self.state = torch.stack(next_states).mean(dim=0)
+        
+        return self.state, rewards
+    
+    def train_episode(self, horizon: int = 100, use_nash: bool = True):
+        """训练一个episode"""
+        episode_rewards = [[] for _ in self.agents]
+        episode_losses = []
+        nash_gaps = []
+        
+        state = self.reset()
+        
+        for t in range(horizon):
+            # Phase 1: 各智能体独立选择动作
+            actions = [
+                agent.select_action(state, explore=True, epsilon=max(0.1, 1.0 - t/horizon)) 
+                for agent in self.agents
+            ]
+            
+            # Phase 2: Nash均衡调整（可选）
+            if use_nash and t % 5 == 0:
+                actions = self.nash_solver.solve(state, actions)
+                nash_gap = self.nash_solver.compute_nash_gap(actions, state)
+                nash_gaps.append(nash_gap)
+            
+            # Phase 3: 执行动作
+            next_state, rewards = self.step(actions)
+            
+            # Phase 4: 更新各智能体
+            total_loss = 0
+            for i, agent in enumerate(self.agents):
+                others_actions = [actions[j] for j in range(len(actions)) if j != i]
+                loss = agent.update_policy(state, actions[i], rewards[i], next_state, others_actions)
+                total_loss += loss
+                episode_rewards[i].append(rewards[i].item())
+            
+            episode_losses.append(total_loss / len(self.agents))
+            state = next_state
+        
+        return {
+            'rewards': episode_rewards,
+            'losses': episode_losses,
+            'nash_gaps': nash_gaps,
+            'final_state': state
+        }
+
+
+# =============================================================================
+# PART 4: 电力系统环境
+# =============================================================================
+
+class PowerGridEnvironment:
+    """电力系统仿真环境"""
+    def __init__(self, num_buses: int = 39, config: Dict = None):
+        self.num_buses = num_buses
+        self.config = config or {}
+        self.topology = self._create_topology()
+        self.state_dim = num_buses * 4  # V, θ, P, Q per bus
+        self.action_dim = 4  # 每个智能体的动作维度
+        
+        # 系统参数
+        self.base_voltage = 1.0
+        self.base_power = 100.0  # MVA
+        self.renewable_capacity = self.config.get('renewable_capacity', 100.0)
+        
+        # 状态变量
+        self.voltage = torch.ones(num_buses)
+        self.angle = torch.zeros(num_buses)
+        self.active_power = torch.zeros(num_buses)
+        self.reactive_power = torch.zeros(num_buses)
+        
+    def _create_topology(self):
+        """创建IEEE 39-bus拓扑（简化版）"""
+        G = nx.Graph()
+        G.add_nodes_from(range(self.num_buses))
+        
+        # 创建简化的连接（实际应使用IEEE标准数据）
+        for i in range(self.num_buses - 1):
+            G.add_edge(i, i + 1, impedance=0.01 + 0.1j)
+        
+        # 添加一些交叉连接
+        for i in range(0, self.num_buses, 10):
+            if i + 5 < self.num_buses:
+                G.add_edge(i, i + 5, impedance=0.02 + 0.15j)
+        
+        return G
+    
+    def reset(self):
+        """重置环境"""
+        self.voltage = torch.ones(self.num_buses) + torch.randn(self.num_buses) * 0.02
+        self.angle = torch.randn(self.num_buses) * 0.1
+        self.active_power = torch.randn(self.num_buses) * 10
+        self.reactive_power = torch.randn(self.num_buses) * 5
+        
+        return self.get_state()
+    
+    def get_state(self):
+        """获取当前状态"""
+        return torch.cat([
+            self.voltage,
+            self.angle,
+            self.active_power,
+            self.reactive_power
+        ])
+    
+    def step(self, actions: List[torch.Tensor]):
+        """执行动作，更新系统状态"""
+        # 聚合所有智能体的动作
+        total_generation = sum([torch.relu(a[0]) * 50 for a in actions])
+        total_load = self.active_power.sum()
+        
+        # 简化的潮流计算（实际应使用牛顿-拉夫逊法）
+        power_imbalance = total_generation - total_load
+        
+        # 更新电压（基于功率平衡）
+        self.voltage += power_imbalance * 0.001 + torch.randn(self.num_buses) * 0.005
+        self.voltage = torch.clamp(self.voltage, 0.9, 1.1)
+        
+        # 更新相角
+        self.angle += torch.randn(self.num_buses) * 0.05
+        
+        # 更新功率流
+        self.active_power += torch.randn(self.num_buses) * 2
+        self.reactive_power += torch.randn(self.num_buses) * 1
+        
+        # 检查约束违反
+        voltage_violation = torch.any((self.voltage < 0.95) | (self.voltage > 1.05))
+        power_violation = torch.abs(power_imbalance) > 10.0
+        
+        done = voltage_violation or power_violation
+        
+        # 计算奖励
+        reward = self._compute_system_reward(power_imbalance)
+        
+        return self.get_state(), reward, done
+    
+    def _compute_system_reward(self, power_imbalance):
+        """计算系统级奖励"""
+        # 功率平衡
+        balance_reward = -torch.abs(power_imbalance)
+        
+        # 电压质量
+        voltage_reward = -torch.abs(self.voltage - 1.0).mean() * 100
+        
+        # 经济性（简化）
+        economic_reward = -self.active_power.abs().sum() * 0.1
+        
+        return balance_reward + voltage_reward + economic_reward
+    
+    def check_constraints(self):
+        """检查运行约束"""
+        violations = {
+            'voltage': torch.sum((self.voltage < 0.95) | (self.voltage > 1.05)).item(),
+            'angle': torch.sum(torch.abs(self.angle) > np.pi/3).item(),
+            'power': torch.sum(torch.abs(self.active_power) > self.base_power).item()
+        }
+        return violations
+
+
+# =============================================================================
+# PART 5: 集成训练流程
+# =============================================================================
+
+class IntegratedSystem:
+    """集成主动学习 + 多智能体博弈系统"""
+    def __init__(self, config: Dict):
+        self.config = config
+        self.env = PowerGridEnvironment(
+            num_buses=config.get('num_buses', 39),
+            config=config
+        )
+        
+        self.game = MultiAgentDigitalTwinGame(
+            num_agents=config.get('num_agents', 4),
+            state_dim=self.env.state_dim,
+            action_dim=config.get('action_dim', 4),
+            config=config
+        )
+        
+        self.active_learner = SafeActiveDigitalTwin(
+            state_dim=self.env.state_dim,
+            action_dim=config.get('action_dim', 4),
+            config=config
+        )
+        
+        # 训练历史
+        self.training_history = {
+            'episode_rewards': [],
+            'episode_losses': [],
+            'nash_gaps': [],
+            'exploration_count': 0,
+            'safety_violations': 0,
+            'uncertainty_reduction': []
+        }
+        
+    def train(self, num_episodes: int = 1000, horizon: int = 100, 
+              exploration_frequency: int = 10):
+        """主训练循环"""
+        
+        for episode in range(num_episodes):
+            state = self.env.reset()
+            episode_reward = 0
+            episode_losses = []
+            episode_uncertainties = []
+            
+            for t in range(horizon):
+                # Phase 1: 各智能体基于当前状态选择动作
+                actions = [
+                    agent.select_action(state, explore=True, 
+                                      epsilon=max(0.05, 1.0 - episode/num_episodes))
+                    for agent in self.game.agents
+                ]
+                
+                # Phase 2: Nash均衡调整（周期性）
+                if t % 5 == 0:
+                    actions = self.game.nash_solver.solve(state, actions)
+                    nash_gap = self.game.nash_solver.compute_nash_gap(actions, state)
+                    if episode % 10 == 0:
+                        self.training_history['nash_gaps'].append(nash_gap)
+                
+                # Phase 3: 主动学习探索（周期性）
+                if t % exploration_frequency == 0 and episode > 50:
+                    explore_action = self.active_learner.select_next_exploration(
+                        state, num_candidates=50
+                    )
+                    
+                    # 检查安全性
+                    _, std = self.active_learner.digital_twin.predict_with_uncertainty(
+                        state.unsqueeze(0), explore_action
+                    )
+                    risk = self.active_learner.safety_checker.evaluate_risk(
+                        state.unsqueeze(0)
+                    )
+                    
+                    if risk.item() < self.active_learner.risk_threshold:
+                        actions[0] = explore_action.squeeze(0)  # 风电场执行探索
+                        self.training_history['exploration_count'] += 1
+                        episode_uncertainties.append(std.mean().item())
+                
+                # Phase 4: 环境交互
+                next_state, env_reward, done = self.env.step(actions)
+                
+                # Phase 5: 更新数字孪生
+                for i, agent in enumerate(self.game.agents):
+                    twin_loss = self.active_learner.update_with_real_data(
+                        state, actions[i], next_state
+                    )
+                
+                # Phase 6: 计算各智能体奖励
+                rewards = []
+                for i, agent in enumerate(self.game.agents):
+                    reward = agent.compute_reward(
+                        state.unsqueeze(0),
+                        actions[i].unsqueeze(0),
+                        next_state.unsqueeze(0)
+                    )
+                    rewards.append(reward)
+                
+                # Phase 7: 更新策略
+                total_loss = 0
+                for i, agent in enumerate(self.game.agents):
+                    others_actions = [actions[j] for j in range(len(actions)) if j != i]
+                    loss = agent.update_policy(
+                        state, actions[i], rewards[i], next_state, others_actions
+                    )
+                    total_loss += loss
+                
+                episode_losses.append(total_loss / len(self.game.agents))
+                episode_reward += sum([r.item() for r in rewards])
+                
+                state = next_state
+                
+                if done:
+                    break
+            
+            # 记录episode统计
+            self.training_history['episode_rewards'].append(episode_reward)
+            self.training_history['episode_losses'].append(np.mean(episode_losses))
+            if episode_uncertainties:
+                self.training_history['uncertainty_reduction'].append(
+                    np.mean(episode_uncertainties)
+                )
+            
+            # 定期输出
+            if episode % 10 == 0:
+                avg_reward = np.mean(self.training_history['episode_rewards'][-10:])
+                avg_loss = np.mean(self.training_history['episode_losses'][-10:])
+                print(f"Episode {episode}/{num_episodes}")
+                print(f"  Avg Reward: {avg_reward:.2f}")
+                print(f"  Avg Loss: {avg_loss:.4f}")
+                print(f"  Explorations: {self.training_history['exploration_count']}")
+                if self.training_history['nash_gaps']:
+                    print(f"  Nash Gap: {self.training_history['nash_gaps'][-1]:.6f}")
+                print(f"  Violations: {self.env.check_constraints()}")
+        
+        return self.training_history
+
+
+# =============================================================================
+# PART 6: 评估指标
+# =============================================================================
+
+class SystemEvaluator:
+    """系统性能评估"""
+    def __init__(self, config: Dict = None):
+        self.config = config or {}
+        self.metrics_history = []
+        
+    def evaluate_prediction_accuracy(self, predictions, targets):
+        """预测精度评估"""
+        if isinstance(predictions, list):
+            predictions = torch.stack(predictions)
+        if isinstance(targets, list):
+            targets = torch.stack(targets)
+            
+        rmse = torch.sqrt(((predictions - targets) ** 2).mean())
+        mae = torch.abs(predictions - targets).mean()
+        mape = (torch.abs((predictions - targets) / (targets + 1e-8))).mean() * 100
+        
+        return {
+            'RMSE': rmse.item(),
+            'MAE': mae.item(),
+            'MAPE': mape.item()
+        }
+    
+    def evaluate_uncertainty_calibration(self, predictions, uncertainties, targets):
+        """不确定性校准评估"""
+        if isinstance(predictions, list):
+            predictions = torch.stack(predictions)
+        if isinstance(uncertainties, list):
+            uncertainties = torch.stack(uncertainties)
+        if isinstance(targets, list):
+            targets = torch.stack(targets)
+            
+        # 预测区间覆盖率
+        lower_bound = predictions - 2 * uncertainties
+        upper_bound = predictions + 2 * uncertainties
+        in_interval = (targets >= lower_bound) & (targets <= upper_bound)
+        coverage = in_interval.float().mean()
+        
+        # 平均区间宽度
+        interval_width = (upper_bound - lower_bound).mean()
+        
+        # 校准误差
+        calibration_error = torch.abs(coverage - 0.95)
+        
+        return {
+            'Coverage': coverage.item(),
+            'Interval_Width': interval_width.item(),
+            'Calibration_Error': calibration_error.item()
+        }
+    
+    def evaluate_nash_gap(self, actions, agents, state):
+        """Nash间隙评估"""
+        gaps = []
+        for i, agent in enumerate(agents):
+            if state.dim() == 1:
+                state = state.unsqueeze(0)
+            if actions[i].dim() == 1:
+                actions[i] = actions[i].unsqueeze(0)
+                
+            current_next_state = agent.digital_twin(state, actions[i])
+            current_reward = agent.compute_reward(state, actions[i], current_next_state)
+            
+            # 计算最优响应
+            best_action = self._compute_best_action(agent, state)
+            best_next_state = agent.digital_twin(state, best_action)
+            best_reward = agent.compute_reward(state, best_action, best_next_state)
+            
+            gap = (best_reward - current_reward).item()
+            gaps.append(max(0, gap))
+        
+        return {
+            'Nash_Gap': max(gaps),
+            'Avg_Gap': np.mean(gaps),
+            'Std_Gap': np.std(gaps)
+        }
+    
+    def evaluate_system_performance(self, states, actions, config):
+        """系统级性能评估"""
+        if isinstance(states, list):
+            states = torch.stack(states)
+        
+        metrics = {}
+        num_buses = config.get('num_buses', 39)
+        
+        # 1. 经济性指标
+        total_generation = sum([torch.abs(a).sum().item() for a in actions])
+        metrics['Total_Generation_Cost'] = total_generation * 30.0
+        
+        renewable_gen = sum([torch.relu(a[0]).item() * 50 for a in actions[:2]])
+        metrics['Renewable_Generation'] = renewable_gen
+        metrics['Renewable_Ratio'] = renewable_gen / (total_generation + 1e-6)
+        
+        # 2. 稳定性指标
+        voltages = states[:, :num_buses]
+        metrics['Voltage_Mean'] = voltages.mean().item()
+        metrics['Voltage_Std'] = voltages.std().item()
+        metrics['Voltage_Violations'] = (
+            (voltages < 0.95).sum() + (voltages > 1.05).sum()
+        ).item()
+        
+        # 频率偏差（简化）
+        if states.shape[1] > 3 * num_buses:
+            frequency = states[:, 3*num_buses]
+            metrics['Frequency_Deviation'] = torch.abs(frequency - 50.0).mean().item()
+        
+        # 3. 低碳性指标
+        # 假设化石能源碳强度 = 0.8 kg/kWh, 可再生 = 0
+        fossil_gen = total_generation - renewable_gen
+        total_emissions = fossil_gen * 0.8
+        metrics['Carbon_Emissions'] = total_emissions
+        metrics['Carbon_Intensity'] = total_emissions / (total_generation + 1e-6)
+        
+        # 4. 公平性指标（Gini系数）
+        if len(actions) > 0:
+            profits = [a.abs().sum().item() for a in actions]
+            metrics['Profit_Gini'] = self._compute_gini(profits)
+        
+        # 5. 数据效率
+        metrics['Sample_Efficiency'] = len(states)
+        
+        return metrics
+    
+    def evaluate_safety(self, states, actions, safety_checker):
+        """安全性评估"""
+        safety_metrics = {
+            'Total_Explorations': 0,
+            'Safe_Explorations': 0,
+            'Violation_Rate': 0.0,
+            'Risk_Distribution': []
+        }
+        
+        for state, action in zip(states, actions):
+            if state.dim() == 1:
+                state = state.unsqueeze(0)
+            
+            risk = safety_checker.evaluate_risk(state)
+            safety_metrics['Risk_Distribution'].append(risk.item())
+            
+            if risk.item() > safety_checker.risk_threshold:
+                safety_metrics['Total_Explorations'] += 1
+            else:
+                safety_metrics['Safe_Explorations'] += 1
+        
+        total = safety_metrics['Total_Explorations'] + safety_metrics['Safe_Explorations']
+        if total > 0:
+            safety_metrics['Violation_Rate'] = safety_metrics['Total_Explorations'] / total
+        
+        return safety_metrics
+    
+    def compute_trust_score(self, accuracy, calibration, consistency):
+        """数字孪生信任度评分"""
+        # 归一化各指标到[0, 1]
+        norm_accuracy = max(0, 1 - accuracy['RMSE'] / 10.0)
+        norm_calibration = max(0, 1 - calibration['Calibration_Error'])
+        norm_consistency = consistency  # 假设已归一化
+        
+        # 加权组合
+        alpha, beta, gamma = 0.4, 0.3, 0.3
+        trust_score = (
+            alpha * norm_accuracy +
+            beta * norm_calibration +
+            gamma * norm_consistency
+        )
+        
+        return {
+            'Trust_Score': trust_score,
+            'Accuracy_Component': norm_accuracy,
+            'Calibration_Component': norm_calibration,
+            'Consistency_Component': norm_consistency
+        }
+    
+    def _compute_best_action(self, agent, state):
+        """计算单智能体最优动作"""
+        return agent.select_action(state, explore=False, epsilon=0.0)
+    
+    def _compute_gini(self, values):
+        """计算Gini系数"""
+        if len(values) == 0:
+            return 0.0
+        
+        sorted_values = np.sort(values)
+        n = len(values)
+        cumsum = np.cumsum(sorted_values)
+        
+        return (2 * np.sum((np.arange(1, n+1)) * sorted_values)) / (n * cumsum[-1]) - (n + 1) / n
+
+
+# =============================================================================
+# PART 7: 实验案例
+# =============================================================================
+
+class ExperimentRunner:
+    """实验运行器"""
+    def __init__(self, config: Dict):
+        self.config = config
+        self.results = {}
+        
+    def run_case1_extreme_scenarios(self):
+        """Case 1: 极端场景主动学习"""
+        print("\n=== Case 1: Extreme Scenario Active Learning ===")
+        
+        scenarios = {
+            'low_wind_high_solar': {
+                'wind_factor': 0.2,
+                'solar_factor': 1.5,
+                'load_factor': 1.2
+            },
+            'high_volatility': {
+                'wind_factor': 1.0,
+                'solar_factor': 1.0,
+                'volatility': 2.0
+            },
+            'maintenance': {
+                'wind_factor': 0.5,
+                'solar_factor': 0.3,
+                'load_factor': 1.0
+            }
+        }
+        
+        results = {}
+        for scenario_name, scenario_config in scenarios.items():
+            print(f"\nTesting scenario: {scenario_name}")
+            
+            # 被动学习基准
+            passive_system = IntegratedSystem({**self.config, **scenario_config})
+            passive_history = passive_system.train(
+                num_episodes=100,
+                horizon=50,
+                exploration_frequency=1000  # 禁用主动学习
+            )
+            
+            # 主动学习方法
+            active_system = IntegratedSystem({**self.config, **scenario_config})
+            active_history = active_system.train(
+                num_episodes=100,
+                horizon=50,
+                exploration_frequency=10
+            )
+            
+            results[scenario_name] = {
+                'passive': passive_history,
+                'active': active_history
+            }
+        
+        self.results['case1'] = results
+        return results
+    
+    def run_case2_game_evolution(self):
+        """Case 2: 多智能体博弈演化"""
+        print("\n=== Case 2: Multi-Agent Game Evolution ===")
+        
+        carbon_prices = [0, 30, 60, 100]
+        results = {}
+        
+        for carbon_price in carbon_prices:
+            print(f"\nTesting carbon price: ${carbon_price}/tCO2")
+            
+            config = {**self.config, 'carbon_price': carbon_price}
+            system = IntegratedSystem(config)
+            history = system.train(num_episodes=200, horizon=100)
+            
+            results[f'carbon_{carbon_price}'] = history
+        
+        self.results['case2'] = results
+        return results
+    
+    def run_case3_ablation_study(self):
+        """Case 3: 消融实验"""
+        print("\n=== Case 3: Ablation Study ===")
+        
+        configurations = {
+            'baseline': {
+                'twin_update': False,
+                'exploration': None,
+                'use_nash': False
+            },
+            'passive_twin': {
+                'twin_update': True,
+                'exploration': 'random',
+                'use_nash': False
+            },
+            'active_single': {
+                'twin_update': True,
+                'exploration': 'active',
+                'use_nash': False,
+                'num_agents': 1
+            },
+            'full_method': {
+                'twin_update': True,
+                'exploration': 'active',
+                'use_nash': True,
+                'num_agents': 4
+            }
+        }
+        
+        results = {}
+        for config_name, config_settings in configurations.items():
+            print(f"\nTesting configuration: {config_name}")
+            
+            merged_config = {**self.config, **config_settings}
+            system = IntegratedSystem(merged_config)
+            
+            if config_settings['exploration'] == 'active':
+                exploration_freq = 10
+            elif config_settings['exploration'] == 'random':
+                exploration_freq = 5
+            else:
+                exploration_freq = 1000
+            
+            history = system.train(
+                num_episodes=150,
+                horizon=80,
+                exploration_frequency=exploration_freq
+            )
+            
+            results[config_name] = history
+        
+        self.results['case3'] = results
+        return results
+    
+    def evaluate_all_results(self):
+        """评估所有实验结果"""
+        print("\n=== Evaluating All Results ===")
+        
+        evaluator = SystemEvaluator(self.config)
+        evaluation_summary = {}
+        
+        for case_name, case_results in self.results.items():
+            print(f"\nEvaluating {case_name}...")
+            case_eval = {}
+            
+            if isinstance(case_results, dict):
+                for config_name, history in case_results.items():
+                    if 'episode_rewards' in history:
+                        case_eval[config_name] = {
+                            'final_reward': np.mean(history['episode_rewards'][-10:]),
+                            'convergence_speed': self._compute_convergence_speed(
+                                history['episode_rewards']
+                            ),
+                            'stability': np.std(history['episode_rewards'][-20:])
+                        }
+            
+            evaluation_summary[case_name] = case_eval
+        
+        return evaluation_summary
+    
+    def _compute_convergence_speed(self, rewards):
+        """计算收敛速度"""
+        if len(rewards) < 10:
+            return len(rewards)
+        
+        target = np.mean(rewards[-10:])
+        for i, r in enumerate(rewards):
+            if r >= target * 0.9:
+                return i
+        
+        return len(rewards)
+
+
+# =============================================================================
+# PART 8: 主函数
+# =============================================================================
+
+def main():
+    """主函数"""
+    # 配置
+    config = {
+        'num_buses': 39,
+        'num_agents': 4,
+        'action_dim': 4,
+        'renewable_capacity': 100.0,
+        'V_min': 0.95,
+        'V_max': 1.05,
+        'f_nominal': 50.0,
+        'f_threshold': 0.2,
+        'line_capacity': 100.0,
+        'kappa': 2.0,
+        'lambda_safety': 10.0,
+        'risk_threshold': 0.01,
+        'gamma': 0.99,
+        'tau': 0.005
+    }
+    
+    print("=" * 60)
+    print("Multi-Agent Digital Twin with Active Learning")
+    print("=" * 60)
+    
+    # 快速测试
+    print("\n--- Quick Test ---")
+    system = IntegratedSystem(config)
+    history = system.train(num_episodes=50, horizon=50, exploration_frequency=10)
+    
+    print("\n--- Training Summary ---")
+    print(f"Total Episodes: 50")
+    print(f"Final Avg Reward: {np.mean(history['episode_rewards'][-10:]):.2f}")
+    print(f"Total Explorations: {history['exploration_count']}")
+    print(f"Safety Violations: {history['safety_violations']}")
+    
+    # 评估
+    evaluator = SystemEvaluator(config)
+    
+    # 完整实验（可选）
+    run_full_experiments = False
+    if run_full_experiments:
+        print("\n--- Running Full Experiments ---")
+        runner = ExperimentRunner(config)
+        
+        runner.run_case1_extreme_scenarios()
+        runner.run_case2_game_evolution()
+        runner.run_case3_ablation_study()
+        
+        evaluation = runner.evaluate_all_results()
+        print("\n--- Evaluation Summary ---")
+        for case, results in evaluation.items():
+            print(f"\n{case}:")
+            for config, metrics in results.items():
+                print(f"  {config}: {metrics}")
+    
+    print("\n" + "=" * 60)
+    print("Experiment Completed!")
+    print("=" * 60)
+
+
+if __name__ == "__main__":
+    main()
+```

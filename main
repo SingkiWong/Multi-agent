@@ -491,10 +491,10 @@ class StorageAgent(Agent):
         # 充放电功率
         charge = torch.relu(-action[:, 0]) * 50  # 充电
         discharge = torch.relu(action[:, 0]) * 50  # 放电
-        
+
         # 更新SOC
-        self.soc += (discharge - charge) / self.capacity * 0.1
-        self.soc = np.clip(self.soc, 0.1, 0.9)
+        delta_soc = ((discharge - charge) / self.capacity * 0.1).mean().item()
+        self.soc = max(0.1, min(0.9, self.soc + delta_soc))
         
         # 套利收益
         arbitrage = price * (discharge - charge)
@@ -506,7 +506,8 @@ class StorageAgent(Agent):
         degradation = 0.01 * (charge + discharge)
         
         # SOC约束惩罚
-        soc_penalty = 100 * (torch.relu(0.2 - self.soc) + torch.relu(self.soc - 0.8))
+        soc_tensor = torch.tensor(self.soc, dtype=action.dtype, device=action.device)
+        soc_penalty = 100 * (torch.relu(0.2 - soc_tensor) + torch.relu(soc_tensor - 0.8))
         
         reward = arbitrage + regulation_revenue - degradation - soc_penalty
         return reward.mean()
